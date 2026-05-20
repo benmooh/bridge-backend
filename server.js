@@ -133,6 +133,54 @@ Règles STRICTES :
   }
 });
 
+
+// ── Parse contrat de prêt ──────────────────────────
+app.post("/api/parse-loan", async (req,res) => {
+  const {base64}=req.body;
+  if(!base64) return res.status(400).json({error:"PDF manquant"});
+
+  const PROMPT = `Tu es un expert en crédit bancaire. Analyse ce contrat de prêt/crédit et extrais les informations clés.
+Réponds UNIQUEMENT en JSON valide, rien d'autre :
+{
+  "name": "type de crédit (ex: Crédit Auto, Prêt Immobilier, Crédit Conso, Sofinco, Oney, Cofidis...)",
+  "capital": montant_emprunté_en_euros (nombre),
+  "rate": taux_annuel_effectif_global_TAEG_en_pourcentage (nombre, ex: 3.5),
+  "duration": durée_totale_en_mois (nombre entier),
+  "monthly": mensualité_en_euros (nombre),
+  "start": "YYYY-MM-DD date première échéance ou date d'effet",
+  "lender": "nom de l'organisme prêteur",
+  "type": "immo|auto|conso|revolving|autre"
+}
+Cherche dans le document : montant financé/emprunté, TAEG ou taux effectif global, durée en mois, mensualité, date de première échéance.
+Si une valeur est introuvable, mets null.`;
+
+  let msg, lastErr;
+  for(let attempt=0;attempt<3;attempt++){
+    try{
+      msg=await anthropic.messages.create({
+        model:"claude-haiku-4-5",max_tokens:1000,
+        messages:[{role:"user",content:[
+          {type:"document",source:{type:"base64",media_type:"application/pdf",data:base64}},
+          {type:"text",text:PROMPT}
+        ]}]
+      });
+      break;
+    }catch(e){
+      lastErr=e;
+      if(e.message?.includes("overloaded")||e.status===529){
+        await new Promise(r=>setTimeout(r,(attempt+1)*3000));
+      } else throw e;
+    }
+  }
+  if(!msg) return res.status(500).json({error:lastErr?.message});
+  try{
+    const txt=msg.content?.[0]?.text||"{}";
+    console.log("LOAN PARSE:", txt.substring(0,300));
+    const match=txt.match(/\{[\s\S]*\}/);
+    res.json(match?JSON.parse(match[0]):{});
+  }catch(e){res.status(500).json({error:e.message});}
+});
+
 // ── Catégorisation IA ──────────────────────────────
 app.post("/api/categorize", async (req,res) => {
   const {text}=req.body;
