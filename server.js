@@ -61,27 +61,21 @@ app.post("/api/parse-pdf", async (req,res) => {
   const {base64} = req.body;
   if (!base64) return res.status(400).json({error:"PDF manquant"});
 
-  const PROMPT = `Tu es un expert comptable. Analyse ce relevé bancaire (BNP, Revolut, Société Générale, LCL, ou autre banque) et extrait TOUTES les transactions visibles sur ces pages.
-
-Réponds UNIQUEMENT avec un tableau JSON valide, sans aucun texte avant ou après.
-Format (commence par [ et termine par ]) :
-[{"name":"Spotify","amount":-9.99,"date":"16/04","cat":"abonnement","icon":"🎵","is_subscription":true,"merchant_domain":"spotify.com","frequency":"monthly"}]
-
-Règles STRICTES :
-- amount : NÉGATIF = argent sorti, POSITIF = argent entrant
-- Pour Revolut : "Argent sortant" = négatif, "Argent entrant" = positif
-- IGNORER les lignes "Sur la Pocket EUR", "Retrait depuis une Pocket" (mouvements internes)
-- IGNORER les lignes de solde et de résumé
-- date : format JJ/MM
-- name : nom court lisible
-- cat : abonnement|alimentation|transport|loisir|sante|shopping|logement|revenu|virement|frais|unknown
-- Commence DIRECTEMENT par [ sans aucun texte avant`;
+  const PROMPT = `Extrais TOUTES les transactions de ce relevé bancaire en JSON compact.
+RÈGLES:
+- Réponds UNIQUEMENT avec [ ... ] JSON valide, rien d'autre
+- amount: négatif=sorti, positif=entrant (Revolut: "Argent sortant"=négatif)
+- IGNORER: "Sur la Pocket EUR", "Retrait depuis une Pocket", lignes de solde
+- date: JJ/MM, name: court, cat: abonnement|alimentation|transport|loisir|sante|shopping|logement|revenu|virement|frais|unknown
+- JSON COMPACT sans espaces inutiles
+- Format: [{"name":"X","amount":-9.99,"date":"01/04","cat":"transport","icon":"🚗","is_subscription":false,"merchant_domain":null,"frequency":"unique"}]
+- Commence DIRECTEMENT par [`;
 
   async function parseChunk(b64, attempt=0) {
     try {
       const msg = await anthropic.messages.create({
         model: "claude-haiku-4-5",
-        max_tokens: 8000,
+        max_tokens: 16000,
         messages: [{
           role: "user",
           content: [
@@ -150,7 +144,7 @@ IMPORTANT: Extrait UNIQUEMENT les transactions des 4 DERNIERS MOIS du document.`
       for (let i = 0; i < passes.length; i++) {
         const msg = await anthropic.messages.create({
           model: "claude-haiku-4-5",
-          max_tokens: 8000,
+          max_tokens: 16000,
           messages: [{
             role: "user",
             content: [
