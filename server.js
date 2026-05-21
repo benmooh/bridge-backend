@@ -58,105 +58,154 @@ app.get("/api/transactions", async (req,res) => {
 
 // ── Parse PDF ──────────────────────────────────────
 app.post("/api/parse-pdf", async (req,res) => {
-  const {base64}=req.body;
-  if(!base64) return res.status(400).json({error:"PDF manquant"});
+  const {base64} = req.body;
+  if (!base64) return res.status(400).json({error:"PDF manquant"});
 
-  const PROMPT = `Tu es un expert comptable. Analyse ce relevé bancaire (BNP, Revolut, Société Générale, LCL, ou autre banque) et extrait TOUTES les transactions du compte principal.
+  const PROMPT = `Tu es un expert comptable. Analyse ce relevé bancaire (BNP, Revolut, Société Générale, LCL, ou autre banque) et extrait TOUTES les transactions visibles sur ces pages.
 
 Réponds UNIQUEMENT avec un tableau JSON valide, sans aucun texte avant ou après.
 Format (commence par [ et termine par ]) :
 [{"name":"Spotify","amount":-9.99,"date":"16/04","cat":"abonnement","icon":"🎵","is_subscription":true,"merchant_domain":"spotify.com","frequency":"monthly"}]
 
 Règles STRICTES :
-- amount : NÉGATIF = argent sorti (dépense, virement sortant), POSITIF = argent entrant (crédit, virement reçu)
+- amount : NÉGATIF = argent sorti, POSITIF = argent entrant
 - Pour Revolut : "Argent sortant" = négatif, "Argent entrant" = positif
-- date : format JJ/MM (extrais le jour et le mois de la date)
-- name : nom court et lisible (ex: "Uber" pas "Ubr* Pending.uber.com Amsterdam", "Loyer" pour les loyers, "Apple" pas "Apple.com/bill")
-- cat : abonnement | alimentation | transport | loisir | sante | shopping | logement | revenu | frais | virement | unknown
-  * abonnement : Netflix, Spotify, Apple, Free, SFR, Orange, Disney+, YouTube, Claude.ai
-  * alimentation : restaurants, supermarchés, fast-food, épiceries
-  * transport : Uber, Heetch, SNCF, essence, péage, parking, transports
-  * logement : loyer, charges
-  * virement : virements entre personnes, "To Ben", "From Fatoumata" etc.
-  * revenu : salaires, remboursements reçus, Moneygram entrant, PayPal entrant
-  * frais : frais bancaires, remboursements de crédit
-- is_subscription : true si service récurrent mensuel/annuel
-- merchant_domain : domaine web du marchand si connu (uber.com, apple.com, anthropic.com...), sinon null
-- frequency : "monthly" | "annual" | "unique"
-- INCLURE toutes les lignes SAUF les mouvements internes de Pocket/épargne (lignes "Sur la Pocket EUR" et "Retrait depuis une Pocket")
-- NE PAS inclure les lignes de solde ou de résumé
+- IGNORER les lignes "Sur la Pocket EUR", "Retrait depuis une Pocket" (mouvements internes)
+- IGNORER les lignes de solde et de résumé
+- date : format JJ/MM
+- name : nom court lisible
+- cat : abonnement|alimentation|transport|loisir|sante|shopping|logement|revenu|virement|frais|unknown
 - Commence DIRECTEMENT par [ sans aucun texte avant`;
 
-  let msg, lastErr;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  async function parseChunk(b64, attempt=0) {
     try {
-      msg = await anthropic.messages.create({
+      const msg = await anthropic.messages.create({
         model: "claude-haiku-4-5",
         max_tokens: 8000,
         messages: [{
           role: "user",
           content: [
-            { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
-            { type: "text", text: PROMPT }
+            {type:"document", source:{type:"base64", media_type:"application/pdf", data:b64}},
+            {type:"text", text:PROMPT}
           ]
         }]
       });
-      break;
-    } catch(e) {
-      lastErr = e;
-      if (e.message?.includes("overloaded") || e.status === 529) {
-        console.log(`Overloaded, retry ${attempt+1}/4 dans ${(attempt+1)*3}s...`);
-        await new Promise(r => setTimeout(r, (attempt+1) * 3000));
-      } else {
-        console.error("ERREUR PDF:", e.message, e.status);
-        throw e;
-      }
-    }
-  }
 
-  if (!msg) {
-    console.error("Toutes les tentatives ont échoué:", lastErr?.message);
-    return res.status(500).json({error: lastErr?.message || "Erreur inconnue"});
+      const txt = msg.content?.[0]?.text || "[]";
+      console.log("RÉPONSE IA:", txt.substring(0, 300));
+
+      let clean = txt.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
+      let match = clean.match(/\[[\s\S]*\]/);
+      if (!match) return [];
+
+      let jsonStr = match[0];
+      try {
+        return JSON.parse(jsonStr);
+      } catch(e) {
+        // Réparer JSON tronqué
+        const lastClose = jsonStr.lastIndexOf("}");
+        if (lastClose > 0) {
+          jsonStr = jsonStr.substring(0, lastClose + 1) + "]";
+          try { return JSON.parse(jsonStr); } catch(e2) { return []; }
+        }
+        return [];
+      }
+    } catch(e) {
+      if ((e.message?.includes("overloaded") || e.status===529) && attempt < 3) {
+        await new Promise(r=>setTimeout(r,(attempt+1)*4000));
+        return parseChunk(b64, attempt+1);
+      }
+      console.error("Erreur chunk:", e.message);
+      return [];
+    }
   }
 
   try {
-    const txt = msg.content?.[0]?.text || "[]";
-    console.log("RÉPONSE IA (parse-pdf):", txt.substring(0, 600));
+    // Décoder le PDF pour estimer la taille
+    const pdfBuffer = Buffer.from(base64, 'base64');
+    const pdfSizeMB = pdfBuffer.length / (1024*1024);
+    console.log(`PDF size: ${pdfSizeMB.toFixed(2)} MB`);
 
-    // Nettoyer les backticks markdown
-    let clean = txt.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+    let allTransactions = [];
 
-    // Extraire le tableau JSON
-    let match = clean.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error("Pas de tableau JSON trouvé");
+    if (pdfSizeMB <= 3) {
+      // Petit PDF — un seul appel
+      allTransactions = await parseChunk(base64);
+    } else {
+      // Gros PDF — découper en 3 passes avec prompt différent
+      console.log("Gros PDF détecté — parsing en plusieurs passes...");
 
-    let jsonStr = match[0];
+      const passes = [
+        `${PROMPT}
 
-    // Réparer JSON tronqué : fermer les objets/tableaux incomplets
-    try {
-      JSON.parse(jsonStr);
-    } catch(parseErr) {
-      console.log("JSON tronqué, tentative de réparation...");
-      // Supprimer le dernier objet incomplet
-      const lastComma = jsonStr.lastIndexOf(",{");
-      const lastComplete = jsonStr.lastIndexOf("}");
-      if (lastComplete > 0) {
-        jsonStr = jsonStr.substring(0, lastComplete + 1) + "]";
+IMPORTANT: Extrait UNIQUEMENT les transactions des 4 PREMIERS MOIS du document.`,
+        `${PROMPT}
+
+IMPORTANT: Extrait UNIQUEMENT les transactions des mois 5 à 8 du document.`,
+        `${PROMPT}
+
+IMPORTANT: Extrait UNIQUEMENT les transactions des 4 DERNIERS MOIS du document.`,
+      ];
+
+      for (let i = 0; i < passes.length; i++) {
+        const msg = await anthropic.messages.create({
+          model: "claude-haiku-4-5",
+          max_tokens: 8000,
+          messages: [{
+            role: "user",
+            content: [
+              {type:"document", source:{type:"base64", media_type:"application/pdf", data:base64}},
+              {type:"text", text: passes[i]}
+            ]
+          }]
+        });
+
+        const txt = msg.content?.[0]?.text || "[]";
+        console.log(`Passe ${i+1} réponse:`, txt.substring(0, 200));
+        let clean = txt.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
+        let match = clean.match(/\[[\s\S]*\]/);
+        if (match) {
+          let jsonStr = match[0];
+          try {
+            const txs = JSON.parse(jsonStr);
+            allTransactions = [...allTransactions, ...txs];
+            console.log(`Passe ${i+1}: ${txs.length} transactions`);
+          } catch(e) {
+            const lastClose = jsonStr.lastIndexOf("}");
+            if (lastClose > 0) {
+              jsonStr = jsonStr.substring(0, lastClose+1)+"]";
+              try {
+                const txs = JSON.parse(jsonStr);
+                allTransactions = [...allTransactions, ...txs];
+              } catch(e2) {}
+            }
+          }
+        }
+        // Pause entre les passes
+        if (i < passes.length-1) await new Promise(r=>setTimeout(r,1500));
       }
+
+      // Dédoublonner par nom+date+montant
+      const seen = new Set();
+      allTransactions = allTransactions.filter(tx => {
+        const key = `${tx.name}|${tx.date}|${tx.amount}`;
+        if (seen.has(key)) return false;
+        seen.add(key); return true;
+      });
     }
 
-    const transactions = JSON.parse(jsonStr);
-    if (!Array.isArray(transactions) || transactions.length === 0)
-      throw new Error("Aucune transaction trouvée");
+    if (allTransactions.length === 0) {
+      return res.status(500).json({error:"Aucune transaction trouvée"});
+    }
 
-    console.log(`✅ ${transactions.length} transactions parsées`);
-    res.json({ transactions });
+    console.log(`✅ Total: ${allTransactions.length} transactions`);
+    res.json({transactions: allTransactions});
+
   } catch(e) {
-    console.error("ERREUR PARSING:", e.message);
-    res.status(500).json({ error: e.message });
+    console.error("ERREUR parse-pdf:", e.message);
+    res.status(500).json({error: e.message});
   }
 });
-
 
 // ── Parse contrat de prêt ──────────────────────────
 app.post("/api/parse-loan", async (req,res) => {
