@@ -92,7 +92,7 @@ Règles STRICTES :
     try {
       msg = await anthropic.messages.create({
         model: "claude-haiku-4-5",
-        max_tokens: 4000,
+        max_tokens: 8000,
         messages: [{
           role: "user",
           content: [
@@ -121,11 +121,35 @@ Règles STRICTES :
 
   try {
     const txt = msg.content?.[0]?.text || "[]";
-    console.log("RÉPONSE IA (parse-pdf):", txt.substring(0, 400));
-    const match = txt.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error("Aucune transaction trouvée dans ce relevé");
-    const transactions = JSON.parse(match[0]);
-    if (!Array.isArray(transactions) || transactions.length === 0) throw new Error("Aucune transaction trouvée dans ce relevé");
+    console.log("RÉPONSE IA (parse-pdf):", txt.substring(0, 600));
+
+    // Nettoyer les backticks markdown
+    let clean = txt.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+
+    // Extraire le tableau JSON
+    let match = clean.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("Pas de tableau JSON trouvé");
+
+    let jsonStr = match[0];
+
+    // Réparer JSON tronqué : fermer les objets/tableaux incomplets
+    try {
+      JSON.parse(jsonStr);
+    } catch(parseErr) {
+      console.log("JSON tronqué, tentative de réparation...");
+      // Supprimer le dernier objet incomplet
+      const lastComma = jsonStr.lastIndexOf(",{");
+      const lastComplete = jsonStr.lastIndexOf("}");
+      if (lastComplete > 0) {
+        jsonStr = jsonStr.substring(0, lastComplete + 1) + "]";
+      }
+    }
+
+    const transactions = JSON.parse(jsonStr);
+    if (!Array.isArray(transactions) || transactions.length === 0)
+      throw new Error("Aucune transaction trouvée");
+
+    console.log(`✅ ${transactions.length} transactions parsées`);
     res.json({ transactions });
   } catch(e) {
     console.error("ERREUR PARSING:", e.message);
